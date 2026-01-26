@@ -9,6 +9,7 @@ license = "BSD-3-Clause"
 dependencies = [
     "numpy < 1.25; python_version < '3.9'",
     "numpy >= 1.25; python_version >= '3.9'",
+    "mcap",
 ]
 dynamic = [
     "version",
@@ -42,6 +43,7 @@ ulog_messages = "pyulog.messages:main"
 ulog_params = "pyulog.params:main"
 ulog2csv = "pyulog.ulog2csv:main"
 ulog2kml = "pyulog.ulog2kml:main"
+ulog2mcap = "pyulog.ulog2mcap:main"
 ulog2rosbag = "pyulog.ulog2rosbag:main"
 ulog_migratedb = "pyulog.migrate_db:main"
 
