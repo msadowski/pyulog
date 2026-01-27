@@ -10,8 +10,6 @@ import json
 import os
 import re
 import typing
-import urllib.request
-import urllib.error
 
 import numpy as np
 from mcap.writer import Writer  # pylint: disable=import-error
@@ -143,6 +141,61 @@ def ned_heading_to_enu_quaternion(ned_heading: float) -> typing.Dict[str, float]
     }
 
 
+def extract_yaw(q: typing.Dict[str, float]) -> float:
+    """Extract yaw (rotation around Z-axis) from quaternion"""
+    w, x, y, z = q["w"], q["x"], q["y"], q["z"]
+    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return yaw
+
+
+def yaw_to_quaternion(yaw: float) -> typing.Dict[str, float]:
+    """Create quaternion from yaw angle (rotation around Z-axis only)"""
+    half_yaw = yaw / 2
+    return {
+        "w": np.cos(half_yaw),
+        "x": 0,
+        "y": 0,
+        "z": np.sin(half_yaw),
+    }
+
+
+def multiply_quaternions(q1: typing.Dict[str, float], q2: typing.Dict[str, float]) -> typing.Dict[str, float]:
+    """Multiply two quaternions"""
+    return {
+        "w": q1["w"] * q2["w"] - q1["x"] * q2["x"] - q1["y"] * q2["y"] - q1["z"] * q2["z"],
+        "x": q1["w"] * q2["x"] + q1["x"] * q2["w"] + q1["y"] * q2["z"] - q1["z"] * q2["y"],
+        "y": q1["w"] * q2["y"] - q1["x"] * q2["z"] + q1["y"] * q2["w"] + q1["z"] * q2["x"],
+        "z": q1["w"] * q2["z"] + q1["x"] * q2["y"] - q1["y"] * q2["x"] + q1["z"] * q2["w"],
+    }
+
+
+def quaternion_conjugate(q: typing.Dict[str, float]) -> typing.Dict[str, float]:
+    """Return the conjugate (inverse rotation) of a quaternion"""
+    return {
+        "w": q["w"],
+        "x": -q["x"],
+        "y": -q["y"],
+        "z": -q["z"],
+    }
+
+
+def extract_pitch_and_roll(q: typing.Dict[str, float]) -> typing.Dict[str, float]:
+    """
+    Extract pitch and roll only (remove yaw) from quaternion.
+    This gives the rotation from base_intermediate (yaw-only) to base_link (full attitude)
+    """
+    # Extract yaw
+    yaw = extract_yaw(q)
+    
+    # Create yaw-only quaternion
+    yaw_q = yaw_to_quaternion(yaw)
+    
+    # Remove yaw: q_pitch_roll = q * yawQ^-1
+    # This gives us the rotation that, when combined with yaw, gives the full attitude
+    yaw_q_inv = quaternion_conjugate(yaw_q)
+    return multiply_quaternions(q, yaw_q_inv)
+
+
 def build_position_covariance(eph: typing.Optional[float], 
                                epv: typing.Optional[float]) -> typing.List[float]:
     """
@@ -168,196 +221,152 @@ def build_position_covariance(eph: typing.Optional[float],
     ]
 
 
-def _load_schema_from_package(schema_name: str) -> typing.Optional[dict]:
+def get_foxglove_json_schema(schema_name: str) -> typing.Tuple[str, dict]:
     """
-    Try to load a schema from the installed foxglove-sdk package.
+    Get a Foxglove JSON schema by name from the installed foxglove-sdk package.
     
     Args:
         schema_name: Schema name like "LocationFix", "FrameTransform", "PosesInFrame"
     
     Returns:
-        Schema dict if found, None otherwise
-    """
-    try:
-        import foxglove_sdk
-        # Try to find the package directory
-        package_dir = os.path.dirname(foxglove_sdk.__file__)
-        schema_path = os.path.join(package_dir, "schemas", "jsonschema", f"{schema_name}.json")
-        
-        if os.path.exists(schema_path):
-            with open(schema_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except (ImportError, AttributeError, OSError):
-        pass
-    
-    return None
-
-
-def _load_schema_from_github(schema_name: str) -> typing.Optional[dict]:
-    """
-    Fetch a schema from the foxglove-sdk GitHub repository.
-    
-    Args:
-        schema_name: Schema name like "LocationFix", "FrameTransform", "PosesInFrame"
-    
-    Returns:
-        Schema dict if fetched successfully, None otherwise
-    """
-    url = f"https://raw.githubusercontent.com/foxglove/foxglove-sdk/main/schemas/jsonschema/{schema_name}.json"
-    
-    try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            if response.status == 200:
-                return json.loads(response.read().decode('utf-8'))
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError):
-        pass
-    
-    return None
-
-
-def get_foxglove_schema(schema_name: str) -> dict:
-    """
-    Get a Foxglove JSON schema by name.
-    
-    Tries to load from foxglove-sdk package first, then falls back to GitHub.
-    
-    Args:
-        schema_name: Schema name like "LocationFix", "FrameTransform", "PosesInFrame"
-    
-    Returns:
-        Schema dict
+        Tuple of (full_schema_name, json_schema_dict)
     
     Raises:
-        ValueError: If schema cannot be loaded from either source
+        ValueError: If schema cannot be loaded from foxglove-sdk package
     """
-    # Try loading from installed package first
-    schema = _load_schema_from_package(schema_name)
-    if schema:
-        return schema
-    
-    # Fallback to GitHub
-    schema = _load_schema_from_github(schema_name)
-    if schema:
-        return schema
-    
-    raise ValueError(f"Could not load schema '{schema_name}' from foxglove-sdk package or GitHub")
+    try:
+        from foxglove.schemas import LocationFix, FrameTransform, PosesInFrame
+        
+        # Map schema names to their classes
+        schema_classes = {
+            "LocationFix": LocationFix,
+            "FrameTransform": FrameTransform,
+            "PosesInFrame": PosesInFrame,
+        }
+        
+        if schema_name not in schema_classes:
+            raise ValueError(f"Unknown schema name: {schema_name}")
+        
+        schema_class = schema_classes[schema_name]
+        
+        # Get the schema object to get the full schema name
+        schema_obj = schema_class.get_schema()
+        full_schema_name = schema_obj.name
+        
+        # Create an instance and build JSON schema from it
+        instance = schema_class()
+        json_schema = _build_json_schema_from_instance(instance, full_schema_name)
+        
+        return full_schema_name, json_schema
+    except ImportError as e:
+        raise ValueError(
+            f"Could not load schema '{schema_name}' from foxglove-sdk package. "
+            f"Make sure foxglove-sdk is installed. Error: {e}"
+        )
+    except (AttributeError, FileNotFoundError, json.JSONDecodeError) as e:
+        raise ValueError(
+            f"Could not find or load JSON schema for '{schema_name}' in foxglove-sdk package. "
+            f"Error: {e}"
+        )
 
 
-def get_foxglove_location_fix_schema() -> dict:
+def _build_json_schema_from_instance(instance, full_schema_name: str) -> dict:
+    """
+    Build JSON schema from a schema class instance by inspecting its fields.
+    """
+    from google.protobuf.json_format import MessageToDict
+    
+    # Convert the instance to a dict to see its structure
+    try:
+        msg_dict = MessageToDict(instance, including_default_value_fields=True)
+    except Exception:
+        # Fallback: try to get fields from the descriptor
+        msg_dict = {}
+        if hasattr(instance, 'DESCRIPTOR'):
+            for field in instance.DESCRIPTOR.fields:
+                msg_dict[field.name] = None
+    
+    # Build JSON schema from the message structure
+    json_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": full_schema_name,
+        "type": "object",
+        "properties": {},
+    }
+    
+    # Get field information from the descriptor
+    if hasattr(instance, 'DESCRIPTOR'):
+        descriptor = instance.DESCRIPTOR
+        required_fields = []
+        
+        for field in descriptor.fields:
+            field_name = field.name
+            field_schema = _protobuf_field_to_json_schema(field, descriptor)
+            json_schema["properties"][field_name] = field_schema
+            
+            # Check if field is required (not optional and not repeated with default)
+            if field.label != field.LABEL_REPEATED:
+                required_fields.append(field_name)
+        
+        if required_fields:
+            json_schema["required"] = required_fields
+    
+    return json_schema
+
+
+def _protobuf_field_to_json_schema(field, message_descriptor) -> dict:
+    """Convert a protobuf field descriptor to a JSON schema type definition."""
+    # Map protobuf types to JSON schema types
+    type_map = {
+        1: {"type": "number"},   # double
+        2: {"type": "number"},   # float
+        3: {"type": "integer"},  # int64
+        4: {"type": "integer"},  # uint64
+        5: {"type": "integer"},  # int32
+        6: {"type": "integer"},  # fixed64
+        7: {"type": "integer"},  # fixed32
+        8: {"type": "boolean"},  # bool
+        9: {"type": "string"},   # string
+        11: {"type": "object"},  # message
+        13: {"type": "integer"}, # uint32
+        14: {"type": "integer"}, # enum
+        15: {"type": "integer"}, # sfixed32
+        16: {"type": "integer"}, # sfixed64
+        17: {"type": "integer"}, # sint32
+        18: {"type": "integer"}, # sint64
+    }
+    
+    base_schema = type_map.get(field.type, {"type": "string"})
+    
+    # Handle repeated fields (arrays)
+    if field.label == field.LABEL_REPEATED:
+        return {
+            "type": "array",
+            "items": base_schema.copy()
+        }
+    
+    # Handle message types (nested objects)
+    if field.type == field.TYPE_MESSAGE:
+        # For nested messages, create a basic object schema
+        # In a full implementation, we'd recurse into the message type
+        return {"type": "object"}
+    
+    return base_schema.copy()
+
+
+def get_foxglove_location_fix_schema() -> typing.Tuple[str, dict]:
     """Return JSON schema for foxglove.LocationFix"""
-    return get_foxglove_schema("LocationFix")
+    return get_foxglove_json_schema("LocationFix")
 
 
-def get_foxglove_frame_transform_schema() -> dict:
+def get_foxglove_frame_transform_schema() -> typing.Tuple[str, dict]:
     """Return JSON schema for foxglove.FrameTransform"""
-    # Note: The GitHub repo has FrameTransforms.json (plural) which contains FrameTransform
-    # We need to extract the items schema from it
-    try:
-        schema = get_foxglove_schema("FrameTransforms")
-        # Extract the FrameTransform schema from the items
-        if "properties" in schema and "transforms" in schema["properties"]:
-            items_schema = schema["properties"]["transforms"]["items"]
-            # Update title to match what we need
-            items_schema["title"] = "foxglove.FrameTransform"
-            return items_schema
-    except ValueError:
-        pass
-    
-    # Fallback: try FrameTransform.json directly
-    try:
-        return get_foxglove_schema("FrameTransform")
-    except ValueError:
-        # Ultimate fallback: return hardcoded schema
-        return {
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "title": "foxglove.FrameTransform",
-            "type": "object",
-            "properties": {
-                "timestamp": {
-                    "type": "object",
-                    "properties": {
-                        "sec": {"type": "integer"},
-                        "nsec": {"type": "integer"}
-                    },
-                    "required": ["sec", "nsec"]
-                },
-                "parent_frame_id": {"type": "string"},
-                "child_frame_id": {"type": "string"},
-                "translation": {
-                    "type": "object",
-                    "properties": {
-                        "x": {"type": "number"},
-                        "y": {"type": "number"},
-                        "z": {"type": "number"}
-                    },
-                    "required": ["x", "y", "z"]
-                },
-                "rotation": {
-                    "type": "object",
-                    "properties": {
-                        "w": {"type": "number"},
-                        "x": {"type": "number"},
-                        "y": {"type": "number"},
-                        "z": {"type": "number"}
-                    },
-                    "required": ["w", "x", "y", "z"]
-                }
-            },
-            "required": ["timestamp", "parent_frame_id", "child_frame_id", "translation", "rotation"]
-        }
+    return get_foxglove_json_schema("FrameTransform")
 
 
-def get_foxglove_poses_in_frame_schema() -> dict:
+def get_foxglove_poses_in_frame_schema() -> typing.Tuple[str, dict]:
     """Return JSON schema for foxglove.PosesInFrame"""
-    try:
-        return get_foxglove_schema("PosesInFrame")
-    except ValueError:
-        # Fallback: return hardcoded schema
-        return {
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "title": "foxglove.PosesInFrame",
-            "type": "object",
-            "properties": {
-                "timestamp": {
-                    "type": "object",
-                    "properties": {
-                        "sec": {"type": "integer"},
-                        "nsec": {"type": "integer"}
-                    },
-                    "required": ["sec", "nsec"]
-                },
-                "frame_id": {"type": "string"},
-                "poses": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "position": {
-                                "type": "object",
-                                "properties": {
-                                    "x": {"type": "number"},
-                                    "y": {"type": "number"},
-                                    "z": {"type": "number"}
-                                },
-                                "required": ["x", "y", "z"]
-                            },
-                            "orientation": {
-                                "type": "object",
-                                "properties": {
-                                    "w": {"type": "number"},
-                                    "x": {"type": "number"},
-                                    "y": {"type": "number"},
-                                    "z": {"type": "number"}
-                                },
-                                "required": ["w", "x", "y", "z"]
-                            }
-                        },
-                        "required": ["position", "orientation"]
-                    }
-                }
-            },
-            "required": ["timestamp", "frame_id", "poses"]
-        }
+    return get_foxglove_json_schema("PosesInFrame")
 
 
 def map_to_foxglove_schema(message_name: str) -> typing.Optional[str]:
@@ -373,8 +382,13 @@ def map_to_foxglove_schema(message_name: str) -> typing.Optional[str]:
     return foxglove_mappings.get(message_name)
 
 
-def build_foxglove_schema(schema_name: str) -> dict:
-    """Return JSON schema definition for a Foxglove schema"""
+def build_foxglove_schema(schema_name: str) -> typing.Tuple[str, str, bytes]:
+    """
+    Return JSON schema definition for a Foxglove schema.
+    
+    Returns:
+        Tuple of (full_schema_name, encoding, schema_data_bytes)
+    """
     schema_builders = {
         "foxglove.LocationFix": get_foxglove_location_fix_schema,
         "foxglove.FrameTransform": get_foxglove_frame_transform_schema,
@@ -382,7 +396,8 @@ def build_foxglove_schema(schema_name: str) -> dict:
     }
     builder = schema_builders.get(schema_name)
     if builder:
-        return builder()
+        full_name, json_schema_dict = builder()
+        return (full_name, "jsonschema", json.dumps(json_schema_dict).encode("utf-8"))
     raise ValueError(f"Unknown Foxglove schema: {schema_name}")
 
 
@@ -514,31 +529,51 @@ def convert_px4_to_foxglove(message_name: str, data: ULog.Data, idx: int,
         }
     
     elif message_name == "vehicle_attitude":
-        if 'q' not in data.data or len(data.data['q']) == 0:
-            return None
+        # In ULog, array fields like q[4] are stored as separate fields: q[0], q[1], q[2], q[3]
+        # Check if we have the array fields
+        if 'q[0]' not in data.data or 'q[1]' not in data.data or 'q[2]' not in data.data or 'q[3]' not in data.data:
+            # Fallback: try accessing as 'q' if it's stored as a structured array
+            if 'q' not in data.data:
+                return None
+            try:
+                q_data = data.data['q']
+                if idx >= len(q_data):
+                    return None
+                q = q_data[idx]
+                if isinstance(q, np.ndarray) and q.shape == (4,):
+                    q_ned = [float(q[0]), float(q[1]), float(q[2]), float(q[3])]  # [w, x, y, z]
+                elif isinstance(q, (list, tuple)) and len(q) == 4:
+                    q_ned = [float(q[0]), float(q[1]), float(q[2]), float(q[3])]  # [w, x, y, z]
+                else:
+                    return None
+            except (IndexError, TypeError, ValueError):
+                return None
+        else:
+            # Access quaternion from separate array fields: q[0], q[1], q[2], q[3]
+            # PX4 stores quaternion as [w, x, y, z]
+            try:
+                q_ned = [
+                    float(data.data['q[0]'][idx]),  # w
+                    float(data.data['q[1]'][idx]),  # x
+                    float(data.data['q[2]'][idx]),  # y
+                    float(data.data['q[3]'][idx]),   # z
+                ]
+            except (IndexError, KeyError, TypeError, ValueError):
+                return None
         
-        q_data = data.data['q']
-        if idx >= len(q_data):
-            return None
-        
-        q = q_data[idx]
-        if not isinstance(q, (list, tuple, np.ndarray)) or len(q) != 4:
-            return None
-        
-        q_ned = [float(q[0]), float(q[1]), float(q[2]), float(q[3])]  # [w, x, y, z]
+        # Convert NED quaternion to ENU
         q_enu = ned_quaternion_to_enu(q_ned)
         
         # Extract pitch and roll only (remove yaw)
         # This gives the rotation from base_intermediate (yaw-only) to base_link (full attitude)
-        # For simplicity, we'll use the full quaternion here
-        # A more sophisticated implementation would extract pitch/roll only
+        pitch_roll_rotation = extract_pitch_and_roll(q_enu)
         
         return {
             "timestamp": timestamp,
             "parent_frame_id": "base_intermediate",
             "child_frame_id": "base_link",
             "translation": {"x": 0.0, "y": 0.0, "z": 0.0},  # No translation, only rotation
-            "rotation": q_enu,
+            "rotation": pitch_roll_rotation,
         }
     
     return None
@@ -604,19 +639,22 @@ def convert_ulog2mcap(ulog_file_name: str, mcap_file_name: str, messages: typing
                 # Check if we should use Foxglove schema
                 foxglove_schema_name = map_to_foxglove_schema(d.name)
                 if foxglove_schema_name:
-                    schema = build_foxglove_schema(foxglove_schema_name)
-                    schema_name = foxglove_schema_name
+                    full_schema_name, encoding, schema_data = build_foxglove_schema(foxglove_schema_name)
+                    schema_id = mcap.register_schema(
+                        name=full_schema_name,
+                        encoding=encoding,
+                        data=schema_data,
+                    )
+                    schemas[d.name] = schema_id
                 else:
                     # Build JSON schema from ULog message format
                     schema = build_json_schema(d.name, ulog)
-                    schema_name = d.name
-                
-                schema_id = mcap.register_schema(
-                    name=schema_name,
-                    encoding="jsonschema",
-                    data=json.dumps(schema).encode("utf-8"),
-                )
-                schemas[d.name] = schema_id
+                    schema_id = mcap.register_schema(
+                        name=d.name,
+                        encoding="jsonschema",
+                        data=json.dumps(schema).encode("utf-8"),
+                    )
+                    schemas[d.name] = schema_id
             
             # Register channel
             channel_key = (d.name, d.multi_id)
