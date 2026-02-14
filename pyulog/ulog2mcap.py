@@ -12,13 +12,16 @@ import re
 import typing
 
 import numpy as np
-from mcap.writer import Writer  # pylint: disable=import-error
+from mcap.writer import Writer, CompressionType  # pylint: disable=import-error
 
 from .core import ULog
 
 #pylint: disable=too-many-locals, invalid-name, too-many-branches, too-many-statements
 
 ARRAY_PATTERN = re.compile(r"(.*?)\[(.*?)\]")
+
+# Path segment length in meters for flight path tracking
+PATH_SEGMENT_LENGTH = 0.1
 
 
 def _get_primitive_type(ulog_type: str) -> typing.Optional[str]:
@@ -603,6 +606,10 @@ def convert_ulog2mcap(ulog_file_name: str, mcap_file_name: str, messages: typing
     """
     Convert a ULog file to MCAP format using Foxglove schemas.
     
+    A single flight path (PosesInFrame) containing all segments the aircraft flew
+    is always generated and published on /px4/flight_path at the beginning of
+    the recording.
+    
     :param ulog_file_name: The ULog filename to open and read
     :param mcap_file_name: The MCAP filename to open and write
     :param messages: A comma-separated list of message names to filter
@@ -627,9 +634,27 @@ def convert_ulog2mcap(ulog_file_name: str, mcap_file_name: str, messages: typing
     schemas = {}  # Map message_name -> schema_id
     channels = {}  # Map (message_name, multi_id) -> channel_id
     
+    # Path tracking: accumulate full flight path (all segments), published once at start
+    last_path_position = None  # Last position where we dropped a point (ENU coordinates)
+    path_poses = []  # All poses for the final path message
+
     with open(mcap_file_name, "wb") as stream:
-        mcap = Writer(stream)
+        mcap = Writer(stream, compression=CompressionType.LZ4)
         mcap.start()
+
+        # Always register path channel (PosesInFrame) for full flight path
+        path_schema_name = "foxglove.PosesInFrame"
+        path_full_schema_name, path_encoding, path_schema_data = build_foxglove_schema(path_schema_name)
+        path_schema_id = mcap.register_schema(
+            name=path_full_schema_name,
+            encoding=path_encoding,
+            data=path_schema_data,
+        )
+        path_channel_id = mcap.register_channel(
+            schema_id=path_schema_id,
+            topic="/px4/flight_path",
+            message_encoding="json",
+        )
         
         # First pass: register all schemas and channels
         for d in data:
@@ -671,7 +696,20 @@ def convert_ulog2mcap(ulog_file_name: str, mcap_file_name: str, messages: typing
                 )
                 channels[channel_key] = channel_id
         
-        # Second pass: write messages
+        # Minimum timestamp in the log (for publishing path at start of recording)
+        min_relative_timestamp_us = min(
+            t for d in data for t in d.data["timestamp"]
+        ) if data and any(len(d.data["timestamp"]) > 0 for d in data) else 0
+        if use_absolute_time:
+            start_timestamp_ns = convert_timestamp(
+                min_relative_timestamp_us,
+                reference_time_us,
+                first_relative_timestamp_us,
+            )
+        else:
+            start_timestamp_ns = min_relative_timestamp_us * 1000
+
+        # Second pass: write messages and accumulate path poses
         items = []
         for d in data:
             channel_id = channels[(d.name, d.multi_id)]
@@ -709,7 +747,48 @@ def convert_ulog2mcap(ulog_file_name: str, mcap_file_name: str, messages: typing
                         message[field] = _get_value(d, field, field_schema, idx)
                 
                 items.append((channel_id, absolute_timestamp_ns, message))
-        
+
+                # Accumulate flight path from vehicle_local_position (full path, emitted once at start)
+                if d.name == "vehicle_local_position":
+                    x = float(d.data.get('x', [0])[idx])
+                    y = float(d.data.get('y', [0])[idx])
+                    z = float(d.data.get('z', [0])[idx])
+                    heading = d.data.get('heading', [None])[idx] if 'heading' in d.data else None
+
+                    # Convert to ENU coordinates (local coordinate system)
+                    pos_enu = ned_to_enu_position(x, y, z)
+
+                    # Drop a point when moved PATH_SEGMENT_LENGTH or more
+                    should_drop_point = False
+                    if last_path_position is None:
+                        should_drop_point = True
+                    else:
+                        dx = pos_enu["x"] - last_path_position["x"]
+                        dy = pos_enu["y"] - last_path_position["y"]
+                        dz = pos_enu["z"] - last_path_position["z"]
+                        distance = np.sqrt(dx * dx + dy * dy + dz * dz)
+                        if distance >= PATH_SEGMENT_LENGTH:
+                            should_drop_point = True
+
+                    if should_drop_point:
+                        if heading is not None and not (isinstance(heading, (int, float)) and np.isnan(heading)):
+                            rotation = ned_heading_to_enu_quaternion(float(heading))
+                        else:
+                            rotation = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+                        path_poses.append({
+                            "position": pos_enu,
+                            "orientation": rotation,
+                        })
+                        last_path_position = pos_enu.copy()
+
+        # Publish full flight path once at the beginning of the recording
+        path_message = {
+            "timestamp": convert_timestamp_to_foxglove_time(start_timestamp_ns),
+            "frame_id": "local_origin",
+            "poses": path_poses,
+        }
+        items.append((path_channel_id, start_timestamp_ns, path_message))
+
         # Sort by timestamp and write
         items.sort(key=lambda x: x[1])
         for channel_id, timestamp_ns, message in items:
