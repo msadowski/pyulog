@@ -6,4 +6,7 @@ dist/
 .eggs/
 *.sqlite3
 venv/
+.venv/
+*.mcap
+uv.lock
 .DS_Store

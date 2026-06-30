@@ -10,7 +10,7 @@ import tempfile
 
 from ddt import ddt, data
 
-from pyulog import ulog2csv, info, params, messages, extract_gps_dump
+from pyulog import ulog2csv, ulog2mcap, info, params, messages, extract_gps_dump
 
 try:
     from StringIO import StringIO
@@ -93,6 +93,18 @@ class TestCommandLineTools(unittest.TestCase):
             os.path.join(TEST_PATH, 'sample.ulg')
         ]
         extract_gps_dump.main()
+
+    @data('sample')
+    def test_ulog2mcap(self, test_case):
+        """
+        Test that 'ulog2mcap' runs without error.
+        """
+        tmpdir = tempfile.gettempdir()
+        ulog_file_name = os.path.join(TEST_PATH, test_case + '.ulg')
+        output_file = os.path.join(tmpdir, test_case + '.mcap')
+        ulog2mcap.convert_ulog2mcap(ulog_file_name, output_file, None)
+        assert os.path.isfile(output_file)
+        assert os.path.getsize(output_file) > 0
 
     @data('sample', 'sample_appended', 'sample_px4_events')
     def test_messages_cli(self, test_case):

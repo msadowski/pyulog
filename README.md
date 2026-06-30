@@ -10,6 +10,7 @@ The provided [command line scripts](#scripts) are:
 - `ulog_params`: extract parameters from an ULog file.
 - `ulog2csv`: convert ULog to CSV files.
 - `ulog2kml`: convert ULog to KML files.
+- `ulog2mcap`: convert ULog to MCAP (Foxglove) files.
 
 
 ## Installation
@@ -211,6 +212,39 @@ optional arguments:
   --camera-trigger CAMERA_TRIGGER
                         Camera trigger topic name (e.g. camera_capture)
 ```
+
+### Convert ULog to MCAP files (ulog2mcap)
+
+> **Note** The `mcap` and `foxglove-sdk` modules must be installed. They are included as dependencies when installing pyulog.
+
+Usage:
+```
+usage: ulog2mcap [-h] [-m MESSAGES] [-i] [-d key=value] [-n METADATA_NAME]
+                 file.ulg file.mcap
+
+Convert ULog to MCAP
+
+positional arguments:
+  file.ulg              ULog input file
+  file.mcap             MCAP output file
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -m MESSAGES, --messages MESSAGES
+                        Only consider given messages. Must be a comma-
+                        separated list of names, like
+                        'sensor_combined,vehicle_gps_position'
+  -i, --ignore          Ignore string parsing exceptions
+  -d key=value, --metadata key=value
+                        Additional file-level metadata (repeatable)
+  -n METADATA_NAME, --metadata-name METADATA_NAME
+                        Name for metadata group, if adding metadata
+```
+
+In addition to the ULog data topics (published under `/px4/...`), the converter also writes:
+- `/px4/flight_path` — full flight path as a Foxglove `PosesInFrame`
+- `/log_message` — logged text messages as Foxglove `Log`
+- `/parameters` — initial parameters and subsequent changes as JSON
 
 ### Convert ULog to rosbag files (ulog2rosbag)
 
