@@ -507,26 +507,55 @@ def build_parameters_json_schema(initial_parameters: typing.Dict[str, typing.Any
     }
 
 
-def _get_value(data: ULog.Data, fieldname: str, schema: dict, idx: int) -> typing.Any:
+def _read_string_data(
+    data: ULog.Data,
+    field_name: str,
+    array_size: int,
+    data_index: int,
+    disable_str_exceptions: bool = False,
+) -> str:
+    """Parse a data field as a null-terminated string."""
+    value = ""
+    for index in range(array_size):
+        character = int(data.data[f"{field_name}[{index}]"][data_index])
+        if character == 0:
+            break
+        try:
+            value += chr(character)
+        except ValueError:
+            if not disable_str_exceptions:
+                raise
+    return value
+
+
+def _get_value(
+    data: ULog.Data,
+    fieldname: str,
+    schema: dict,
+    idx: int,
+    disable_str_exceptions: bool = False,
+) -> typing.Any:
     """Extract value from ULog data based on schema"""
     if schema["type"] == "object":
         value = {}
         for prop_field, prop_field_schema in schema["properties"].items():
             nested_field = f"{fieldname}.{prop_field}"
-            value[prop_field] = _get_value(data, nested_field, prop_field_schema, idx)
+            value[prop_field] = _get_value(
+                data, nested_field, prop_field_schema, idx, disable_str_exceptions,
+            )
         return value
     if schema["type"] == "array":
         array_length = schema["minItems"]
         value = []
         for i in range(array_length):
-            value.append(_get_value(data, f"{fieldname}[{i}]", schema["items"], idx))
+            value.append(_get_value(
+                data, f"{fieldname}[{i}]", schema["items"], idx, disable_str_exceptions,
+            ))
         return value
     if schema["type"] == "string":
-        string_length = schema["minLength"]
-        value = ""
-        for i in range(string_length):
-            value += chr(int(data.data[f"{fieldname}[{i}]"][idx]))
-        return value
+        return _read_string_data(
+            data, fieldname, schema["minLength"], idx, disable_str_exceptions,
+        )
 
     value = data.data[fieldname][idx]
     if np.isnan(value):
@@ -925,13 +954,17 @@ def convert_ulog2mcap(
                         schema = build_json_schema(d.name, ulog)
                         message = {}
                         for field, field_schema in schema["properties"].items():
-                            message[field] = _get_value(d, field, field_schema, idx)
+                            message[field] = _get_value(
+                                d, field, field_schema, idx, disable_str_exceptions,
+                            )
                 else:
                     # Use generic JSON schema
                     schema = build_json_schema(d.name, ulog)
                     message = {}
                     for field, field_schema in schema["properties"].items():
-                        message[field] = _get_value(d, field, field_schema, idx)
+                        message[field] = _get_value(
+                            d, field, field_schema, idx, disable_str_exceptions,
+                        )
 
                 items.append((channel_id, absolute_timestamp_ns, message))
 
