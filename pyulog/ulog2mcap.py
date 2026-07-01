@@ -716,30 +716,15 @@ def _collect_log_message_items(
     return items
 
 
-def _collect_parameter_message_items(
+def _collect_parameter_change_items(
     ulog: ULog,
     parameter_channel_id: int,
     use_absolute_time: bool,
     reference_time_us: typing.Optional[int],
     first_relative_timestamp_us: typing.Optional[int],
 ) -> typing.List[typing.Tuple[int, int, dict]]:
-    """Collect parameter messages for the /parameters channel."""
+    """Collect changed-parameter updates for the /parameters channel."""
     items = []
-    if not ulog.initial_parameters:
-        return items
-
-    initial_timestamp_ns = relative_timestamp_to_ns(
-        ulog.start_timestamp,
-        use_absolute_time,
-        reference_time_us,
-        first_relative_timestamp_us,
-    )
-    initial_params = {
-        param_name: _parameter_value_to_python(param_value)
-        for param_name, param_value in ulog.initial_parameters.items()
-    }
-    items.append((parameter_channel_id, initial_timestamp_ns, initial_params))
-
     for timestamp, param_name, param_value in ulog.changed_parameters:
         timestamp_ns = relative_timestamp_to_ns(
             timestamp,
@@ -753,6 +738,16 @@ def _collect_parameter_message_items(
             {param_name: _parameter_value_to_python(param_value)},
         ))
     return items
+
+
+def _build_initial_parameters_message(ulog: ULog) -> typing.Optional[dict]:
+    """Build the initial /parameters snapshot message."""
+    if not ulog.initial_parameters:
+        return None
+    return {
+        param_name: _parameter_value_to_python(param_value)
+        for param_name, param_value in ulog.initial_parameters.items()
+    }
 
 
 def main():
@@ -1012,7 +1007,7 @@ def convert_ulog2mcap(
             ))
 
         if parameter_channel_id is not None:
-            items.extend(_collect_parameter_message_items(
+            items.extend(_collect_parameter_change_items(
                 ulog,
                 parameter_channel_id,
                 use_absolute_time,
@@ -1020,10 +1015,16 @@ def convert_ulog2mcap(
                 first_relative_timestamp_us,
             ))
 
-        # Publish full flight path once at the beginning of the recording.
+        # Publish full flight path and initial parameters at the beginning of the recording.
         # Use the minimum message timestamp (valid MCAP uint64, non-negative).
         start_timestamp_ns = min((t for (_, t, _) in items), default=0)
         start_timestamp_ns = max(0, min(MCAP_TIMESTAMP_MAX, int(start_timestamp_ns)))
+
+        if parameter_channel_id is not None:
+            initial_params = _build_initial_parameters_message(ulog)
+            if initial_params is not None:
+                items.insert(0, (parameter_channel_id, start_timestamp_ns, initial_params))
+
         path_message = {
             "timestamp": convert_timestamp_to_foxglove_time(start_timestamp_ns),
             "frame_id": "local_origin",
